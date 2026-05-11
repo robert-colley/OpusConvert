@@ -1,0 +1,52 @@
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Python bytecode and caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- IDE / editor settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Data and outputs (project-specific) ---
+data/
+out/
+outputs/
+*.mpr
+*.[0-9]
+*.[0-9][0-9]
+*.[0-9][0-9][0-9]
+
+# --- Generated figures ---
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# --- Excel reference files (typically large/private) ---
+*.xlsx
+*.xls
+
+# --- Generated artifacts ---
+results.csv
+experiments.csv
+
+# --- Personal processing scripts ---
+# These match your YYMMDD-electrolyte-replicate.py convention.
+# Comment this out if you want to share specific example scripts.
+[0-9][0-9][0-9][0-9][0-9][0-9]-*-*.py
