@@ -3,9 +3,6 @@ opus_convert/plotter.py
 
 Three-panel plot generator combining differential spectra, electrochemistry,
 and raw spectra into a single figure.
-
-Original Author: Robert Colley (2026)
-License: MIT
 """
 
 from __future__ import annotations
@@ -19,6 +16,7 @@ import matplotlib.pyplot as plt
 
 from parser import OpusConvert
 from synchronizer import ECSynchronizer
+from scipy.optimize import curve_fit
 
 
 class OpusPlotter:
@@ -59,6 +57,7 @@ class OpusPlotter:
         self.differential_spectra: dict[str, np.ndarray] = {}
         # 'mode' of plotting. Smart plot labeling. baseline vs. successive
         self.differential_mode: str = "baseline"
+        self.subtract_ok = False
 
     # ==================================================================
     # Data loading
@@ -194,10 +193,16 @@ class OpusPlotter:
                     f"mode='successive' requires at least 2 spectra; got {len(diff_keys)}."
                 )
             result: dict[str, np.ndarray] = {}
-            for i in range(1, len(diff_keys)):
-                current = self.parser.spectra[diff_keys[i]]["AB"]
-                previous = self.parser.spectra[diff_keys[i - 1]]["AB"]
-                label = f"{diff_labels[i]} − {diff_labels[i - 1]}"
+            for i in range(0, len(diff_keys)):
+                if i == 0:
+                    current = self.parser.spectra[diff_keys[i]]["AB"]
+                    previous = self.parser.spectra[background_key]["AB"]
+                    label = f"{diff_labels[i]} - OCV"
+                else:
+                    current = self.parser.spectra[diff_keys[i]]["AB"]
+                    previous = self.parser.spectra[diff_keys[i - 1]]["AB"]
+                    label = f"{diff_labels[i]} − {diff_labels[i - 1]}"
+                    
                 result[label] = self.shift_to_origin(current - previous)
             self.differential_spectra = result
 
@@ -234,6 +239,10 @@ class OpusPlotter:
         ax2_xlim: tuple[float, float] | None = None,
         ax2_ylim: tuple[float, float] | None = None,
         ax3_ylim: tuple[float, float] | None = None,
+        zero_line: bool = False,
+        zero_idx: int = 0,
+        view_baseline: bool = False,
+        shift_index: int = 1000
     ) -> plt.Figure:
         """
         Generate the canonical 3-panel layout. Auto-scales the EC-Lab and
@@ -263,6 +272,13 @@ class OpusPlotter:
         marker_colors = plt.cm.plasma(np.linspace(0.7, 0, len(diff_keys))).tolist()
 
         # ---- Build each panel ----
+        self._plot_raw_spectra_panel(
+            ax3, diff_keys, marker_colors, x_bounds,
+            ax3_peaks, ax3_ylim, line_width, font_size,
+            view_baseline = view_baseline,
+            shift_index = shift_index
+        )
+
         self._plot_differentials_panel(
             ax1, background_key, diff_colors, x_bounds,
             title, ax1_peaks, line_width, font_size,
@@ -271,17 +287,15 @@ class OpusPlotter:
             pad = ax1_ref_pad,
             diff_scale = ax1_diff_scale,
             ref_scale = ax1_ref_scale,
-            conditions = ax1_conditions
+            conditions = ax1_conditions,
+            zero_line = zero_line,
+            zero_idx = zero_idx
         )
         self._plot_electrochemistry_panel(
             ax2, diff_keys, marker_colors, target_ec_step,
             ax2_peaks, ax2_xlim, ax2_ylim, line_width, font_size, ax2_conditions,
             cycle = target_ec_cycle,
             direction = target_ec_direction,
-        )
-        self._plot_raw_spectra_panel(
-            ax3, diff_keys, marker_colors, x_bounds,
-            ax3_peaks, ax3_ylim, line_width, font_size,
         )
 
         if export_path:
@@ -313,6 +327,8 @@ class OpusPlotter:
         pad: float = 0.005,
         diff_scale: float = 1.0,
         ref_scale: float = 1.0,
+        zero_line: bool = False,
+        zero_idx: int = 0
     ) -> None:
         x_left, x_right = x_bounds
         wn = self.parser.wavenumbers
@@ -326,12 +342,17 @@ class OpusPlotter:
         floor = 0.0
         diffs = list(self.differential_spectra.items())
         for i, (label, y) in enumerate(diffs):
+            zline = np.array([y[zero_idx] * diff_scale for i in range(len(y))])
             y = y * diff_scale
             y = y[i_lo:i_hi + 1]
             if y.min() < 0:
+                zline -= y.min()
                 y = y - y.min()
+            zline += floor 
             stacked = y + floor
             ax.plot(wn_w, stacked, color=colors[i])
+            if zero_line:
+                ax.plot(wn_w, zline[i_lo:i_hi + 1], color = colors[i], ls= ":")
             ax.annotate(
                 label,
                 xy=(x_right, self._y_at_x(wn_w, stacked, 800)), #Do not change on future updates, this keeps label positions from moving wildly
@@ -657,16 +678,36 @@ class OpusPlotter:
         ylim: tuple[float, float] | None,
         line_width: float,
         font_size: int,
+        view_baseline: bool = False,
+        shift_index: int = 1000
     ) -> None:
         x_left, x_right = x_bounds
         wn = self.parser.wavenumbers
 
         # Plot each requested raw spectrum, shifted to share an origin
         traces = []
+
+
         for i, key in enumerate(diff_keys):
-            shifted = self.shift_to_origin(self.parser.spectra[key]["AB"], 1000)
-            ax.plot(wn, shifted, color=colors[i])
-            traces.append(shifted)
+            if view_baseline and self.subtract_ok:
+                ax.plot(wn, self.parser.spectra[key]["Baseline"], color=colors[i], ls=":")
+                ax.plot(wn, self.parser.spectra[key]["AB"], color=colors[i])
+                traces.append(self.parser.spectra[key]["AB"])
+
+            if view_baseline and not self.subtract_ok:
+                shifted = self.shift_to_origin(self.parser.spectra[key]["AB"], shift_index)
+                ax.plot(wn, self.parser.spectra[key]["Baseline"], color=colors[i], ls=":")
+                ax.plot(wn, shifted, color = colors[i])
+                traces.append(shifted)            
+
+            if not view_baseline and not self.subtract_ok:
+                shifted = self.shift_to_origin(self.parser.spectra[key]["AB"], shift_index)
+                ax.plot(wn, shifted, color = colors[i])
+                traces.append(shifted)                
+
+            if not view_baseline and self.subtract_ok:
+                ax.plot(wn, self.parser.spectra[key]["AB"], color=colors[i])
+                traces.append(self.parser.spectra[key]["AB"])
 
         # Auto-compute ylim from the visible window if not provided
         if ylim is None and traces:
@@ -747,6 +788,75 @@ class OpusPlotter:
         if i_left > i_right:
             i_left, i_right = i_right, i_left
         return i_left, i_right
+
+    @staticmethod
+    def exp_baseline(x, a, b, c):
+        return a * np.exp(-b * x) + c
+
+    @staticmethod
+    def cubic_polynomial(x, a, b, c, d):
+        return a * x**3 + b * x**2 + c * x + d
+
+    def baseline_correct(
+        self,
+        spectra_keys: Sequence[str],
+        regions: list,
+        mode: tuple[str,int]|str = "exponential",
+        subtract: bool = False,
+        shift_index: int = 1000
+        ) -> None:
+        """
+        Fit a baseline to a subset of bounding points (as x coords) of a supplied spectrum.
+        Adds a "Baseline" key to the self.parser.spectra dictionary.
+        """
+        for key in spectra_keys:
+            x_data = []
+            y_data = []
+            
+            for x_left, x_right in regions:
+                idx_left, idx_right = self._x_window_indices(self.parser.wavenumbers, x_left, x_right)
+                i0, i1 = sorted((idx_left, idx_right))
+                x_data += self.parser.wavenumbers[i0:i1 + 1].tolist()
+                y_all = self.shift_to_origin(self.parser.spectra[key]["AB"], shift_index)
+                y_data += y_all[i0:i1 + 1].tolist()
+            
+            x_data = np.array(x_data)
+            y_data = np.array(y_data)
+            
+            if type(mode) == str:
+                if mode.lower() == "exponential":                 
+                    p0 = (
+                        np.max(y_data) - np.min(y_data),  # a
+                        1e-3,                             # b
+                        np.min(y_data),                   # c
+                    )
+
+                    popt, _ = curve_fit(
+                        self.exp_baseline,
+                        x_data,
+                        y_data,
+                        p0=p0,
+                        maxfev=10000,
+                    )
+
+                    self.parser.spectra[key]["Baseline"] = self.exp_baseline(
+                        self.parser.wavenumbers,
+                        *popt,
+                    )
+
+            elif type(mode) == tuple and mode[0].lower() == "poly":
+                coeffs = np.polyfit(x_data, y_data, deg = mode[1])
+                self.parser.spectra[key]["Baseline"] = np.polyval(coeffs, self.parser.wavenumbers)
+
+            else:
+                print("This baseline mode hasn't been developed yet.")
+                self.parser.spectra[key]["Baseline"] = np.zeros(len(self.parser.spectra[key]["AB"]))
+            
+            if subtract:
+                self.parser.spectra[key]["AB"] = self.shift_to_origin(self.parser.spectra[key]["AB"],shift_index) - self.parser.spectra[key]["Baseline"]
+                self.subtract_ok = True
+
+
 
     # ==================================================================
     # Static helpers (matplotlib styling)
