@@ -209,6 +209,87 @@ class OpusPlotter:
         return self.differential_spectra
 
     # ==================================================================
+    # Integral calculation
+    # ==================================================================    
+
+    def integrate_peaks(
+        self,
+        peak_windows: list[tuple[float, float]],
+        peak_labels: list[str] | None = None,
+        baseline: str = "trapezoid",
+    ) -> pd.DataFrame:
+        """
+        Integrate each differential spectrum across each peak window.
+
+        Parameters
+        ----------
+        peak_windows
+            List of (x_left, x_right) wavenumber windows defining each peak.
+        peak_labels
+            Display labels for each window. Defaults to "X-Y cm-1" auto-format.
+        baseline
+            "trapezoid" (default): straight line between the window endpoints,
+            equivalent to baseline-subtracted trapezoid rule integration.
+            "fitted": uses self.parser.spectra[key]["Baseline"] from prior
+            baseline_correct() call. Falls back to trapezoid if baseline absent.
+
+        Returns
+        -------
+        DataFrame indexed by spectrum key (matching self.differential_spectra),
+        with one column per peak. Also stored as self.integrated_areas.
+        """
+        if not self.differential_spectra:
+            raise RuntimeError(
+                "No differentials available. Run calculate_differentials() first."
+            )
+
+        if peak_labels is None:
+            peak_labels = [f"{int(min(w))}-{int(max(w))} cm⁻¹" for w in peak_windows]
+        if len(peak_labels) != len(peak_windows):
+            raise ValueError("peak_labels and peak_windows must have same length.")
+
+        wn = self.parser.wavenumbers
+        rows = {}
+
+        for diff_label, y in self.differential_spectra.items():
+            areas_for_this_diff = {}
+            for window, peak_label in zip(peak_windows, peak_labels):
+                i_lo, i_hi = self._x_window_indices(wn, window[0], window[1])
+                x_seg = wn[i_lo:i_hi + 1]
+                y_seg = y[i_lo:i_hi + 1]
+
+                # Baseline construction
+                if baseline == "trapezoid":
+                    # Straight line from (x_seg[0], y_seg[0]) to (x_seg[-1], y_seg[-1])
+                    bl = np.linspace(y_seg[0], y_seg[-1], len(y_seg))
+                elif baseline == "fitted":
+                    # Would need a spectrum-key handle to look up the fitted baseline.
+                    # Skip for now or raise informatively.
+                    raise NotImplementedError(
+                        "baseline='fitted' requires per-spectrum baseline lookup; "
+                        "not yet supported for differential traces."
+                    )
+                else:
+                    raise ValueError(f"Unknown baseline mode: {baseline!r}")
+
+                # np.trapezoid wants ascending x; OPUS wavenumbers are descending,
+                # so flip both before integrating (sign comes out correct).
+                area = np.trapezoid(y_seg - bl, x_seg)
+                # Take absolute value: the sign just reflects integration direction
+                # since OPUS wavenumbers go high-to-low.
+                areas_for_this_diff[peak_label] = -area
+
+            rows[diff_label] = areas_for_this_diff
+
+        df = pd.DataFrame.from_dict(rows, orient="index")
+        df.index.name = "differential"
+        self.integrated_areas = df
+        self._integration_windows = peak_windows  # save for plotting
+        self._integration_labels = peak_labels
+        return df
+
+
+    # ==================================================================
     # Top-level plotting entry point
     # ==================================================================
     def plot_3_panel_experiment(
@@ -454,6 +535,132 @@ class OpusPlotter:
         for peak, offset in peaks:
             self.vline(ax, peak, 0, wn, fs=font_size, offset=offset,
                        anchor_y=anchor, lw=0.4, unit="")
+    # ==================================================================
+    # Plot Integrals panel
+    # ==================================================================            
+    def plot_peak_areas(
+        self,
+        target_ec_step: str | None = None,
+        show_lsv: bool = True,
+        eclab_ylim: tuple[float, float] | None = None,
+        shade_differentials: bool = True,
+        differentials_xlim: tuple[float, float] | None = None,
+        plot_spacing: float = 1e-4,
+        title: str | None = None,
+        export_path: str | None = None,
+        figsize: tuple[float, float] = (10, 5),
+    ) -> plt.Figure:
+        """
+        Two-panel figure: differentials with shaded integration regions (left),
+        peak area vs. potential with optional LSV underlay (right).
+        """
+        if not hasattr(self, "integrated_areas") or self.integrated_areas is None:
+            raise RuntimeError("Run integrate_peaks() first.")
+
+        fig = plt.figure(figsize=figsize, dpi=300)
+        ax1 = fig.add_axes([0.1,0.1,0.4,0.8])
+        ax2 = fig.add_axes([0.65,0.1,0.2,0.8])
+
+        # --- Left panel: differentials with shading ---
+        wn = self.parser.wavenumbers
+        diffs = list(self.differential_spectra.items())
+        colors = plt.cm.plasma(np.linspace(0.7, 0, len(diffs) + 2)).tolist()
+        x_lo, x_hi = self._x_window_indices(wn, differentials_xlim[0], differentials_xlim[1])
+        floor = 0.0
+        # plot_spacing = 1e-4  # could be exposed as a parameter
+        for i, (label, y) in enumerate(diffs):
+            y_shifted = y - y[x_lo:x_hi + 1].min()
+            stacked = y_shifted + floor
+            ax1.plot(wn, stacked, color=colors[i], lw=0.6)
+            ax1.annotate(
+                label, 
+                xy = (wn[x_lo], stacked[0]),
+                xytext = (6,0),
+                textcoords = "offset points",
+                fontsize = 6
+                )
+
+            if shade_differentials:
+                for window in self._integration_windows:
+                    i_lo, i_hi = self._x_window_indices(wn, window[0], window[1])
+                    x_seg = wn[i_lo:i_hi + 1]
+                    y_seg = stacked[i_lo:i_hi + 1]
+                    bl_seg = np.linspace(y_seg[0], y_seg[-1], len(y_seg))
+                    
+                    ax1.fill_between(
+                        x_seg, bl_seg, y_seg,
+                        # where=[(y_seg > bl_seg)],
+                        color=colors[i], alpha=0.25,
+                    )
+
+
+
+
+                    # floor = y_seg.max()
+            floor = stacked[i_lo:i_hi + 1].max() + plot_spacing
+
+        for window in self._integration_windows:
+            self.vline(ax1, window[0], 0, wn, fs=6, offset=(0,0),
+               anchor_y=(0,floor), lw=0.4, unit="")
+            self.vline(ax1, window[1], 0, wn, fs=6, offset=(0,0),
+               anchor_y=(0,floor), lw=0.4, unit="")
+
+        if differentials_xlim:
+            ax1.set_xlim(differentials_xlim)
+        # ax1.invert_xaxis()  # standard FTIR convention
+        ax1.set_xlabel("Wavenumber (cm⁻¹)")
+        ax1.set_ylabel("Δ Absorbance (stacked)")
+        ax1.set_yticklabels([])
+        if title:
+            ax1.set_title(title)
+
+        # --- Right panel: area vs. potential ---
+        # Pull potential for each differential. The differential label encodes
+        # the "current" spectrum; look up its potential from synchronizer.
+        potentials = []
+        for diff_label in self.integrated_areas.index:
+            # Differential labels look like "0.5 V − 0.3 V" or "0.5 V - OCV".
+            # Extract the first voltage (the "current" spectrum's potential).
+            try:
+                v_str = diff_label.split("V")[0].strip()
+                potentials.append(float(v_str))
+            except ValueError:
+                potentials.append(np.nan)
+        potentials = np.array(potentials)
+
+        # LSV underlay
+        if show_lsv and target_ec_step:
+            df = self.synchronizer.eclab_df
+            df = df[df["Source_File"].str.contains(target_ec_step, case=False, na=False)]
+            if not df.empty:
+                current_col = self.synchronizer.find_current_column(df)
+                ax2_lsv = ax2.twinx()
+                ax2_lsv.plot(df["Potential_V"], df[current_col]*1000,
+                             color="gray", alpha=0.5, lw=0.8, zorder=1)
+                ax2_lsv.set_ylim(eclab_ylim)
+                ax2_lsv.set_ylabel(r"I ($\mu$A)", color="gray")
+                ax2_lsv.tick_params(axis="y", labelcolor="gray")
+
+        # Area scatter, one series per peak
+        # peak_colors = plt.cm.viridis(np.linspace(0, 0.85, len(self._integration_labels)))
+        for j, peak_label in enumerate(self._integration_labels):
+            ax2.plot(
+                potentials, self.integrated_areas[peak_label], marker = "o", linestyle = '-',
+                 label=peak_label, zorder=2,
+            )
+
+        ax2.set_xlabel("Potential (V)")
+        ax2.set_ylabel("Integrated peak area (a.u.)")
+        ax2.legend(loc="best", fontsize=8)
+        # ax2.invert_xaxis()  # match LSV convention (high V on left)
+
+        # fig.tight_layout()
+
+        if export_path:
+            os.makedirs(os.path.dirname(export_path), exist_ok=True)
+            fig.savefig(f"{export_path}.png", bbox_inches="tight")
+
+        return fig
 
     # ==================================================================
     # Panel: electrochemistry trace + sample markers
